@@ -83,6 +83,13 @@ sbatch scripts/train.sbatch my-run notes="what changed and why"
 
 `train.sbatch` trains for 1 hour (`time_limit`), then evaluates the last checkpoint on the brainmarks-smri `open` tasks and submits it, except smoke tests.
 
+No Slurm (e.g. a single rented H100)? `train.sbatch` is a plain bash script, so run it directly with `bash`:
+
+```sh
+bash scripts/train.sbatch smoke notes="smoke test" time_limit=5
+bash scripts/train.sbatch my-run notes="what changed and why"
+```
+
 `submit.py` posts the score and your code to [labless](https://labless.dev/nano-projects/nanobrain-smri). Sign in once with `--login-only` before your first job. Remember to push your branch so others can check out your commit.
 
 ## Code

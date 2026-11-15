@@ -3,6 +3,8 @@
 #   sbatch scripts/train.sbatch NAME [OVERRIDES...]
 #
 # Smoke test: sbatch scripts/train.sbatch smoke time_limit=5
+#
+# Without Slurm, run it with bash instead: bash scripts/train.sbatch NAME [OVERRIDES...]
 
 # Slurm options for the MedARC cluster. Edit for yours.
 #SBATCH --job-name=nanobrain
