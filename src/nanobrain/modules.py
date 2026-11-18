@@ -234,28 +234,62 @@ def te_layernorm_mlp(block: "Block") -> nn.Module:
 # Position embedding
 
 
+def sincos_1d(n: int, dim: int, temperature: float = 10000.0) -> Tensor:
+    """(n, dim) sin-cos table for positions 0..n-1, as in MAE / the original Transformer (dim even)."""
+    assert dim % 2 == 0, "sincos_1d: dim must be even"
+    omega = 1.0 / temperature ** (torch.arange(dim // 2, dtype=torch.float64) / (dim // 2))
+    out = torch.arange(n, dtype=torch.float64)[:, None] * omega[None, :]
+    return torch.cat([out.sin(), out.cos()], dim=1).float()
+
+
+def sincos_axis_chunks(embed_dim: int) -> tuple[slice, slice, slice]:
+    """Channel ranges for x, y, z: even-sized thirds (the last takes the remainder)."""
+    c = (embed_dim // 3) // 2 * 2
+    assert c > 0 and (embed_dim - 2 * c) % 2 == 0, "sincos: embed_dim too small or odd"
+    return slice(0, c), slice(c, 2 * c), slice(2 * c, embed_dim)
+
+
 class SeparablePosEmbed3D(nn.Module):
+    # init: "learned" (truncated normal, std 0.02; the default and the original behaviour),
+    # "sincos" (3D sin-cos values, still learned) or "sincos_fixed" (3D sin-cos values, frozen).
+    # sin-cos puts x, y and z each in their own third of the channels, so the sum of the three tables is the
+    # standard concatenated 3D sin-cos embedding (MAE style), in patch-grid units.
+    INITS = ("learned", "sincos", "sincos_fixed")
+
     def __init__(
         self,
         grid_size: tuple[int, int, int],
         embed_dim: int,
         unit: float = 1.0,
+        init: str = "learned",
     ) -> None:
         super().__init__()
+        assert init in self.INITS, f"pos embed init: one of {self.INITS}"
         self.embed_dim = embed_dim
         self.grid_size = grid_size
         self.unit = unit
+        self.init = init
 
         X, Y, Z = grid_size
         self.weight_x = nn.Parameter(torch.empty(X, embed_dim))
         self.weight_y = nn.Parameter(torch.empty(Y, embed_dim))
         self.weight_z = nn.Parameter(torch.empty(Z, embed_dim))
         self.reset_parameters()
+        if init == "sincos_fixed":
+            for weight in (self.weight_x, self.weight_y, self.weight_z):
+                weight.requires_grad_(False)
 
+    @torch.no_grad()
     def reset_parameters(self):
-        nn.init.trunc_normal_(self.weight_x, std=0.02)
-        nn.init.trunc_normal_(self.weight_y, std=0.02)
-        nn.init.trunc_normal_(self.weight_z, std=0.02)
+        if self.init == "learned":
+            nn.init.trunc_normal_(self.weight_x, std=0.02)
+            nn.init.trunc_normal_(self.weight_y, std=0.02)
+            nn.init.trunc_normal_(self.weight_z, std=0.02)
+            return
+        chunks = sincos_axis_chunks(self.embed_dim)
+        for weight, chunk in zip((self.weight_x, self.weight_y, self.weight_z), chunks):
+            weight.zero_()
+            weight[:, chunk] = sincos_1d(weight.shape[0], chunk.stop - chunk.start)
 
     def forward(
         self,
@@ -280,7 +314,7 @@ class SeparablePosEmbed3D(nn.Module):
         return x
 
     def extra_repr(self):
-        return f"{self.embed_dim}, {self.grid_size}, unit={self.unit}"
+        return f"{self.embed_dim}, {self.grid_size}, unit={self.unit}, init={self.init}"
 
 
 # Native resolution patch embedding and head. Kernels live in mm on cells x cells x cells cells

@@ -227,6 +227,9 @@ class ViTMAE3D(nn.Module):
         # gdist_clean: z pools the clean visible tokens only (unified label 0), as the eval embedding is clean
         gdist_std: bool = False,
         gdist_clean: bool = False,
+        # position embedding init for the encoder and the decoder (modules.SeparablePosEmbed3D): "learned" (default,
+        # the original behaviour), "sincos" (3D sin-cos values, learned) or "sincos_fixed" (3D sin-cos, frozen)
+        pos_embed_init: str = "learned",
     ):
         super().__init__()
         self.tumor_one_view = bool(tumor_one_view)
@@ -300,7 +303,7 @@ class ViTMAE3D(nn.Module):
             self.patch_embed = NativeEmbed(patch_size, embed_dim)
         else:
             self.patch_embed = nn.Linear(patch_dim, embed_dim)
-        self.pos_embed = SeparablePosEmbed3D(patch_grid_size, embed_dim)
+        self.pos_embed = SeparablePosEmbed3D(patch_grid_size, embed_dim, init=pos_embed_init)
         if class_tokens:
             self.cls_token = nn.Parameter(torch.empty(1, class_tokens, embed_dim))
         else:
@@ -345,7 +348,7 @@ class ViTMAE3D(nn.Module):
             self.register_buffer("level_thresholds", torch.tensor(levels), persistent=False)
         # training speed, set by train.py (not a model kwarg): see decode_features
         self.decoder_prune_last = False
-        self.decoder_pos_embed = SeparablePosEmbed3D(patch_grid_size, decoder_embed_dim)
+        self.decoder_pos_embed = SeparablePosEmbed3D(patch_grid_size, decoder_embed_dim, init=pos_embed_init)
         self.mask_token = nn.Parameter(torch.empty(1, 1, decoder_embed_dim))
 
         self.decoder_blocks = nn.ModuleList(
