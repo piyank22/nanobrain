@@ -42,7 +42,11 @@ NGPU=$(nvidia-smi -L 2>/dev/null | wc -l)
 OUT=$N/output
 if [ "$MODE" != smoke ]; then
   OUT=$W/output; mkdir -p $OUT $W/labless /root/.cache
-  rm -rf /root/.cache/nanobrain && ln -s $W/labless /root/.cache/nanobrain
+  # keep a token from a login made before this script started: move it onto the volume, then link
+  if [ -d /root/.cache/nanobrain ] && [ ! -L /root/.cache/nanobrain ]; then
+    cp -n /root/.cache/nanobrain/labless_token.json $W/labless/ 2>/dev/null; rm -rf /root/.cache/nanobrain
+  fi
+  [ -L /root/.cache/nanobrain ] || ln -s $W/labless /root/.cache/nanobrain
 fi
 
 # Labless login: the cached token and the /api/auth/github/me call that scripts/submit.py makes before submitting.
@@ -138,6 +142,24 @@ train_line(){ # run_dir -> steps etc. from summary.json
 import json; d=json.load(open('$1/summary.json'))
 print(' '.join(f'{k}={d[k]}' for k in ('step','epochs','wall_seconds','cpus','peak_memory_gb','final_loss') if k in d))" 2>&1
 }
+submit_link(){ # submit.log -> labless run link (submit.py prints "submitted <dir>: <json>")
+  python3 - "$1" <<'PY' 2>/dev/null || echo "(see submit.log)"
+import json, re, sys
+line = [l for l in open(sys.argv[1]) if l.startswith("submitted ")][-1]
+r = json.loads(line.split(": ", 1)[1])
+def find(o):
+    if isinstance(o, dict):
+        for k in ("web_url", "url", "run_url"):
+            if isinstance(o.get(k), str) and o[k].startswith("http"): return o[k]
+        for k in ("run_id", "id"):
+            if isinstance(o.get(k), str) and o[k].startswith("run_"): return "https://labless.dev/runs/" + o[k]
+        for v in o.values():
+            u = find(v)
+            if u: return u
+    return None
+print(find(r) or line.strip()[:200])
+PY
+}
 run_one(){ # gpu name config cpus
   local i=$1 name=$2 cfg=$3 cpus=$4 RR=$R/$2; mkdir -p $RR
   echo "train" > $RR/state; log "RUN $name: train on GPU $i, CPUs $cpus, $cfg"
@@ -155,7 +177,7 @@ run_one(){ # gpu name config cpus
   if [ "$MODE" != smoke ] && [ "$SUBMIT" = 1 ] && [[ "$name" != smoke* ]]; then
     echo "submit" > $RR/state
     if (cd $N && uv run --no-sync python scripts/submit.py $OUT/$name) > $RR/submit.log 2>&1; then
-      log "RUN $name SUBMITTED $(grep -oE 'https://labless[^ ]*' $RR/submit.log | tail -1)"
+      log "RUN $name SUBMITTED $(submit_link $RR/submit.log)"
     else
       issue "RUN $name: submit failed (results are safe in $OUT/$name). Resubmit: cd $N && uv run --no-sync python scripts/submit.py $OUT/$name. $(tail -1 $RR/submit.log | cut -c1-200)"
     fi
