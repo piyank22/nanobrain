@@ -4,6 +4,7 @@
 #
 #   MODE=smoke RUNS="smoke_t5:config.yaml" bash scripts/runpod/session.sh
 #   MODE=full SUBMIT=1 RUNS="t5-s0:config.yaml;sincos-s0:config_sincos.yaml" bash scripts/runpod/session.sh
+#   PARALLEL=0 runs them one after another on GPU 0 (a 1-GPU pod); PARALLEL=1 (default) runs one per GPU at once.
 #
 # Each run gets one GPU and 16 CPUs (the labless reference: 1 H100 + 16 CPUs), taken as the least busy cores.
 # Full sessions need $W on a network volume (marker file $W/.network-volume): run folders, the labless token and
@@ -11,7 +12,7 @@
 # Problems are written as "ISSUE:" lines to $W/progress.log and $W/issues.log (the monitor page shows them).
 set -uo pipefail
 
-MODE=${MODE:-smoke}; SUBMIT=${SUBMIT:-0}
+MODE=${MODE:-smoke}; SUBMIT=${SUBMIT:-0}; PARALLEL=${PARALLEL:-1}
 HOLD_MIN=${HOLD_MIN:-15}                 # minutes to stay up after finishing, to collect results
 NCPU=${NCPU:-16}
 W=${W:-/workspace}; D=${D:-/root/data}; P=${P:-/root/pretrained/facebook_vit-mae-base}
@@ -35,7 +36,8 @@ if [ "$MODE" != smoke ] && [ ! -f $W/.network-volume ]; then
 fi
 IFS=';' read -ra RUNLIST <<< "$RUNS"
 NGPU=$(nvidia-smi -L 2>/dev/null | wc -l)
-[ ${#RUNLIST[@]} -le $NGPU ] || abort "${#RUNLIST[@]} runs but only $NGPU GPUs"
+[ $NGPU -ge 1 ] || abort "no GPU visible"
+[ "$PARALLEL" = 0 ] || [ ${#RUNLIST[@]} -le $NGPU ] || abort "${#RUNLIST[@]} parallel runs but only $NGPU GPUs (use PARALLEL=0)"
 
 OUT=$N/output
 if [ "$MODE" != smoke ]; then
@@ -165,15 +167,21 @@ if [ "$MODE" != smoke ] && [ "$SUBMIT" = 1 ]; then
   who=$(labless_ok) || abort "labless login stopped working before training: no run started"
 fi
 phase runs
-taken=""; pids=()
+log "running ${#RUNLIST[@]} run(s) $([ "$PARALLEL" = 0 ] && echo 'one after another on GPU 0' || echo 'in parallel, one per GPU')"
+taken=""; pids=(); fails=0
 for idx in "${!RUNLIST[@]}"; do
   spec=${RUNLIST[$idx]}; name=${spec%%:*}; cfg=${spec#*:}
   [ -f $N/$cfg ] || { issue "RUN $name: config $cfg not found, skipped"; continue; }
-  cpus=$(pick_cpus $NCPU "$taken"); taken="$taken,$cpus"
-  run_one $idx $name $cfg $cpus &
-  pids+=($!)
+  if [ "$PARALLEL" = 0 ]; then
+    cpus=$(pick_cpus $NCPU "")            # fresh pick per run: the least busy cores right now
+    run_one 0 $name $cfg $cpus || fails=$((fails+1))
+  else
+    cpus=$(pick_cpus $NCPU "$taken"); taken="$taken,$cpus"
+    run_one $idx $name $cfg $cpus &
+    pids+=($!)
+  fi
 done
-fails=0; for p in "${pids[@]}"; do wait $p || fails=$((fails+1)); done
+for p in "${pids[@]}"; do wait $p || fails=$((fails+1)); done
 
 if [ -s $W/issues.log ]; then phase "done with issues"; else phase done; fi
 log "ALL DONE in $(( $(date +%s)-T0 ))s, $fails failed run(s); holding $HOLD_MIN min (touch $W/cancel_stop to keep the pod up)"
