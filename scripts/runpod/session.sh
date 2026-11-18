@@ -1,18 +1,17 @@
 #!/bin/bash
 # One unattended nanobrain session on a RunPod pod, run from a clone of this repo:
-#   labless login check -> setup -> download -> one run per GPU in parallel (train, eval, submit) -> stop the pod.
+#   labless login check -> setup -> download -> runs one after another on GPU 0 (train, eval, submit) -> stop the pod.
 #
 #   MODE=smoke RUNS="smoke_t5:config.yaml" bash scripts/runpod/session.sh
-#   MODE=full SUBMIT=1 RUNS="t5-s0:config.yaml;sincos-s0:config_sincos.yaml" bash scripts/runpod/session.sh
-#   PARALLEL=0 runs them one after another on GPU 0 (a 1-GPU pod); PARALLEL=1 (default) runs one per GPU at once.
+#   MODE=full SUBMIT=1 RUNS="sincos-s0:config_sincos.yaml;sincosL-s0:config_sincosL.yaml" bash scripts/runpod/session.sh
 #
-# Each run gets one GPU and 16 CPUs (the labless reference: 1 H100 + 16 CPUs), taken as the least busy cores.
+# Runs are sequential on one GPU with 16 CPUs (the labless reference: 1 H100 + 16 CPUs), the least busy cores per run.
 # Full sessions need $W on a network volume (marker file $W/.network-volume): run folders, the labless token and
 # the logs live there, so they outlive the pod. Smoke runs are never submitted.
 # Problems are written as "ISSUE:" lines to $W/progress.log and $W/issues.log (the monitor page shows them).
 set -uo pipefail
 
-MODE=${MODE:-smoke}; SUBMIT=${SUBMIT:-0}; PARALLEL=${PARALLEL:-1}
+MODE=${MODE:-smoke}; SUBMIT=${SUBMIT:-0}
 HOLD_MIN=${HOLD_MIN:-15}                 # minutes to stay up after finishing, to collect results
 NCPU=${NCPU:-16}
 W=${W:-/workspace}; D=${D:-/root/data}; P=${P:-/root/pretrained/facebook_vit-mae-base}
@@ -37,7 +36,6 @@ fi
 IFS=';' read -ra RUNLIST <<< "$RUNS"
 NGPU=$(nvidia-smi -L 2>/dev/null | wc -l)
 [ $NGPU -ge 1 ] || abort "no GPU visible"
-[ "$PARALLEL" = 0 ] || [ ${#RUNLIST[@]} -le $NGPU ] || abort "${#RUNLIST[@]} parallel runs but only $NGPU GPUs (use PARALLEL=0)"
 
 OUT=$N/output
 if [ "$MODE" != smoke ]; then
@@ -112,11 +110,11 @@ open('/root/filelist.txt','w').write('\n'.join(paths)); print(len(paths), 'image
   EXTRA="time_limit=10 train_filelist=/root/filelist.txt"
 fi
 
-# --- 2. runs: one per GPU, in parallel ----------------------------------------------------------------------------
-pick_cpus(){ # n exclude(comma list) -> the n least busy allowed cores over 2 s, comma separated
-  python3 - "$1" "$2" <<'PY'
+# --- 2. runs: one after another on GPU 0 -------------------------------------------------------------------------
+pick_cpus(){ # n -> the n least busy allowed cores over 2 s, comma separated
+  python3 - "$1" <<'PY'
 import os, sys, time
-n, excl = int(sys.argv[1]), {int(c) for c in sys.argv[2].split(",") if c}
+n = int(sys.argv[1])
 def snap():
     out = {}
     for line in open("/proc/stat"):
@@ -125,11 +123,8 @@ def snap():
     return out
 a = snap(); time.sleep(2); b = snap()
 busy = {c: 1 - (b[c][0] - a[c][0]) / max(1, b[c][1] - a[c][1]) for c in b}
-allowed = [c for c in os.sched_getaffinity(0) if c in busy]
-cands = sorted((c for c in allowed if c not in excl), key=lambda c: busy[c])
-if len(cands) < n:  # not enough free cores: share the least busy ones rather than return too few
-    print(f"only {len(cands)} free cores for {n}; sharing", file=sys.stderr)
-    cands += sorted((c for c in allowed if c not in cands), key=lambda c: busy[c])
+cands = sorted((c for c in os.sched_getaffinity(0) if c in busy), key=lambda c: busy[c])
+if len(cands) < n: print(f"only {len(cands)} cores available for {n}", file=sys.stderr)
 print(",".join(map(str, sorted(cands[:n]))))
 PY
 }
@@ -164,15 +159,15 @@ def find(o):
 print(find(r) or line.strip()[:200])
 PY
 }
-run_one(){ # gpu name config cpus
-  local i=$1 name=$2 cfg=$3 cpus=$4 RR=$R/$2; mkdir -p $RR
-  echo "train" > $RR/state; log "RUN $name: train on GPU $i, CPUs $cpus, $cfg"
-  (cd $N && CUDA_VISIBLE_DEVICES=$i taskset -c $cpus uv run --no-sync python -m nanobrain.train --config $cfg \
+run_one(){ # name config cpus
+  local name=$1 cfg=$2 cpus=$3 RR=$R/$1; mkdir -p $RR
+  echo "train" > $RR/state; log "RUN $name: train on GPU 0, CPUs $cpus, $cfg"
+  (cd $N && CUDA_VISIBLE_DEVICES=0 taskset -c $cpus uv run --no-sync python -m nanobrain.train --config $cfg \
     --overrides output_dir=$OUT natinit.path=$P name=$name $EXTRA) > $RR/train.log 2>&1 \
     || { echo "failed" > $RR/state; issue "RUN $name: training failed (tail: $(tail -2 $RR/train.log | tr '\n' ' ' | cut -c1-300))"; return 1; }
   log "RUN $name TRAINSUM $(train_line $OUT/$name)"
   echo "eval" > $RR/state
-  (cd $N && CUDA_VISIBLE_DEVICES=$i uv run --no-sync python -m brainmarks_smri vit_mae_3d open --overrides \
+  (cd $N && CUDA_VISIBLE_DEVICES=0 uv run --no-sync python -m brainmarks_smri vit_mae_3d open --overrides \
     "imports=[nanobrain.model]" model_kwargs.checkpoint=$OUT/$name/checkpoint-last.pth output_dir=$OUT/$name name=eval) \
     > $RR/eval.log 2>&1 \
     || { echo "failed" > $RR/state; issue "RUN $name: eval failed (tail: $(tail -2 $RR/eval.log | tr '\n' ' ' | cut -c1-300))"; return 1; }
@@ -193,30 +188,20 @@ if [ "$MODE" != smoke ] && [ "$SUBMIT" = 1 ]; then
   who=$(labless_ok) || abort "labless login stopped working before training: no run started"
 fi
 phase runs
-log "running ${#RUNLIST[@]} run(s) $([ "$PARALLEL" = 0 ] && echo 'one after another on GPU 0' || echo 'in parallel, one per GPU')"
-taken=""; pids=(); fails=0; declare -A pidname
+log "running ${#RUNLIST[@]} run(s) one after another on GPU 0"
+fails=0
 run_ended_badly(){ # name: count it, and flag it if the run died before writing its own issue
   fails=$((fails+1))
   grep -q "RUN $1:" $W/issues.log 2>/dev/null || issue "RUN $1: ended with an error (see $R/$1/)"
   echo "failed" > $R/$1/state 2>/dev/null
 }
-for idx in "${!RUNLIST[@]}"; do
-  spec=${RUNLIST[$idx]}; name=${spec%%:*}; cfg=${spec#*:}
+for spec in "${RUNLIST[@]}"; do
+  name=${spec%%:*}; cfg=${spec#*:}
   [ -f $N/$cfg ] || { issue "RUN $name: config $cfg not found, skipped"; continue; }
-  if [ "$PARALLEL" = 0 ]; then
-    cpus=$(pick_cpus $NCPU "" 2>>$LOG)    # fresh pick per run: the least busy cores right now
-  else
-    cpus=$(pick_cpus $NCPU "$taken" 2>>$LOG); taken="$taken,$cpus"
-  fi
+  cpus=$(pick_cpus $NCPU 2>>$LOG)         # fresh pick per run: the least busy cores right now
   [ -n "$cpus" ] || { issue "RUN $name: no CPUs could be picked, skipped"; fails=$((fails+1)); continue; }
-  if [ "$PARALLEL" = 0 ]; then
-    run_one 0 "$name" "$cfg" "$cpus" || run_ended_badly "$name"
-  else
-    run_one $idx "$name" "$cfg" "$cpus" &
-    pids+=($!); pidname[$!]=$name
-  fi
+  run_one "$name" "$cfg" "$cpus" || run_ended_badly "$name"
 done
-for p in "${pids[@]}"; do wait $p || run_ended_badly "${pidname[$p]}"; done
 
 if [ -s $W/issues.log ]; then phase "done with issues"; else phase done; fi
 log "ALL DONE in $(( $(date +%s)-T0 ))s, $fails failed run(s); holding $HOLD_MIN min (touch $W/cancel_stop to keep the pod up)"
