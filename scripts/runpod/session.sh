@@ -88,25 +88,26 @@ timed_dl(){ # name pattern...
   local b1=$(du -sb $D | cut -f1) s=$(( $(date +%s)-t0 )); [ $s -lt 1 ] && s=1
   log "download $name bytes=$((b1-b0)) seconds=$s MBps=$(( (b1-b0)/s/1000000 ))"
 }
+# Both modes first get the tables, 20 shards and the eval data: enough for a smoke run or the full-session preflight.
+# Full sessions download the remaining shards after the preflight passes.
 phase download
 timed_dl tables "fomo300k/tables/*" || abort "download: tables"
-if [ "$MODE" = smoke ]; then
-  timed_dl shards20 "fomo300k/shards/fomo300k-000*.zip" "fomo300k/shards/fomo300k-001*.zip" || abort "download: shards"
-else
-  timed_dl shards "fomo300k/shards/*" || abort "download: shards"
-fi
+timed_dl shards20 "fomo300k/shards/fomo300k-000*.zip" "fomo300k/shards/fomo300k-001*.zip" || abort "download: shards (first 20)"
 timed_dl evaldata "abide1/*" "adhd200/*" "brats2021/*" "cnp/*" "ixi/*" "openbhb/*" "soop/*" "ucsf_pdgm/*" "upenn_gbm/*" \
   || abort "download: eval data"
 
-EXTRA=""
-if [ "$MODE" = smoke ]; then
+make_filelist(){ # the QC training list restricted to the shards on disk -> /root/filelist.txt
   (cd $N && uv run --no-sync python -c "
 import pandas as pd, pathlib
 s = pd.read_parquet('$D/fomo300k/tables/shards.parquet', columns=['path','shard']).set_index('path')['shard']
 have = {p.relative_to('$D/fomo300k').as_posix() for p in pathlib.Path('$D/fomo300k/shards').glob('*.zip')}
 paths = [p for p in open('src/nanobrain/config/fomo300k_images_qc.txt').read().split() if s.get(p) in have]
 open('/root/filelist.txt','w').write('\n'.join(paths)); print(len(paths), 'images in', len(have), 'shards')
-") >> $LOG 2>&1 || abort "smoke file list"
+") >> $LOG 2>&1
+}
+EXTRA=""
+if [ "$MODE" = smoke ]; then
+  make_filelist || abort "smoke file list"
   EXTRA="time_limit=10 train_filelist=/root/filelist.txt"
 fi
 
@@ -183,6 +184,37 @@ run_one(){ # name config cpus
   fi
   echo "done" > $RR/state
 }
+
+# --- preflight (full sessions): every planned config must train, load in the eval and pass the submission
+# checks before the big download and the hour-long runs. ~5 min per config; any failure stops the pod.
+preflight(){
+  phase preflight
+  make_filelist || abort "preflight: file list"
+  local PF=/root/preflight spec name cfg pn cpus bad
+  for spec in "${RUNLIST[@]}"; do
+    name=${spec%%:*}; cfg=${spec#*:}; pn=pf-$name
+    [ -f $N/$cfg ] || continue                      # reported when the runs start
+    cpus=$(pick_cpus $NCPU 2>>$LOG)
+    (cd $N && CUDA_VISIBLE_DEVICES=0 taskset -c $cpus uv run --no-sync python -m nanobrain.train --config $cfg \
+      --overrides output_dir=$PF natinit.path=$P name=$pn time_limit=3 train_filelist=/root/filelist.txt) \
+      > $R/preflight_$name.train.log 2>&1 \
+      || abort "preflight $name: training failed (tail: $(tail -2 $R/preflight_$name.train.log | tr '\n' ' ' | cut -c1-300))"
+    (cd $N && CUDA_VISIBLE_DEVICES=0 uv run --no-sync python -m brainmarks_smri vit_mae_3d ixi_age --overrides \
+      "imports=[nanobrain.model]" model_kwargs.checkpoint=$PF/$pn/checkpoint-last.pth output_dir=$PF/$pn name=eval) \
+      > $R/preflight_$name.eval.log 2>&1 \
+      || abort "preflight $name: eval could not load or score the checkpoint (tail: $(tail -2 $R/preflight_$name.eval.log | tr '\n' ' ' | cut -c1-300))"
+    # a one-task eval has no open score, so the dry run must report exactly that and nothing else
+    (cd $N && uv run --no-sync python scripts/submit.py --dry-run $PF/$pn) > $R/preflight_$name.submit.log 2>&1
+    bad=$(grep '^error:' $R/preflight_$name.submit.log | grep -v 'eval is incomplete')
+    [ -z "$bad" ] || abort "preflight $name: submission check failed: $(echo $bad | cut -c1-300)"
+    log "PREFLIGHT $name OK: $(train_line $PF/$pn); eval loaded and scored ixi_age; submission checks passed"
+  done
+}
+if [ "$MODE" != smoke ]; then
+  preflight
+  phase download
+  timed_dl shards "fomo300k/shards/*" || abort "download: remaining shards"
+fi
 
 if [ "$MODE" != smoke ] && [ "$SUBMIT" = 1 ]; then
   who=$(labless_ok) || abort "labless login stopped working before training: no run started"
