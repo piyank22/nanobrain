@@ -125,7 +125,11 @@ def snap():
     return out
 a = snap(); time.sleep(2); b = snap()
 busy = {c: 1 - (b[c][0] - a[c][0]) / max(1, b[c][1] - a[c][1]) for c in b}
-cands = sorted((c for c in os.sched_getaffinity(0) if c in busy and c not in excl), key=lambda c: busy[c])
+allowed = [c for c in os.sched_getaffinity(0) if c in busy]
+cands = sorted((c for c in allowed if c not in excl), key=lambda c: busy[c])
+if len(cands) < n:  # not enough free cores: share the least busy ones rather than return too few
+    print(f"only {len(cands)} free cores for {n}; sharing", file=sys.stderr)
+    cands += sorted((c for c in allowed if c not in cands), key=lambda c: busy[c])
 print(",".join(map(str, sorted(cands[:n]))))
 PY
 }
@@ -190,20 +194,29 @@ if [ "$MODE" != smoke ] && [ "$SUBMIT" = 1 ]; then
 fi
 phase runs
 log "running ${#RUNLIST[@]} run(s) $([ "$PARALLEL" = 0 ] && echo 'one after another on GPU 0' || echo 'in parallel, one per GPU')"
-taken=""; pids=(); fails=0
+taken=""; pids=(); fails=0; declare -A pidname
+run_ended_badly(){ # name: count it, and flag it if the run died before writing its own issue
+  fails=$((fails+1))
+  grep -q "RUN $1:" $W/issues.log 2>/dev/null || issue "RUN $1: ended with an error (see $R/$1/)"
+  echo "failed" > $R/$1/state 2>/dev/null
+}
 for idx in "${!RUNLIST[@]}"; do
   spec=${RUNLIST[$idx]}; name=${spec%%:*}; cfg=${spec#*:}
   [ -f $N/$cfg ] || { issue "RUN $name: config $cfg not found, skipped"; continue; }
   if [ "$PARALLEL" = 0 ]; then
-    cpus=$(pick_cpus $NCPU "")            # fresh pick per run: the least busy cores right now
-    run_one 0 $name $cfg $cpus || fails=$((fails+1))
+    cpus=$(pick_cpus $NCPU "" 2>>$LOG)    # fresh pick per run: the least busy cores right now
   else
-    cpus=$(pick_cpus $NCPU "$taken"); taken="$taken,$cpus"
-    run_one $idx $name $cfg $cpus &
-    pids+=($!)
+    cpus=$(pick_cpus $NCPU "$taken" 2>>$LOG); taken="$taken,$cpus"
+  fi
+  [ -n "$cpus" ] || { issue "RUN $name: no CPUs could be picked, skipped"; fails=$((fails+1)); continue; }
+  if [ "$PARALLEL" = 0 ]; then
+    run_one 0 "$name" "$cfg" "$cpus" || run_ended_badly "$name"
+  else
+    run_one $idx "$name" "$cfg" "$cpus" &
+    pids+=($!); pidname[$!]=$name
   fi
 done
-for p in "${pids[@]}"; do wait $p || fails=$((fails+1)); done
+for p in "${pids[@]}"; do wait $p || run_ended_badly "${pidname[$p]}"; done
 
 if [ -s $W/issues.log ]; then phase "done with issues"; else phase done; fi
 log "ALL DONE in $(( $(date +%s)-T0 ))s, $fails failed run(s); holding $HOLD_MIN min (touch $W/cancel_stop to keep the pod up)"
